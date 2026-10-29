@@ -14,6 +14,7 @@
 #include "prx/libSceAgc/Acb/include/Control.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <condition_variable>
 #include <cstddef>
@@ -279,6 +280,7 @@ struct Manager {
     std::uint32_t wakeTokens = 0;
     std::uint64_t pendingInvocations = 0;
     std::uint64_t spinTicks = 0;
+    std::atomic<std::uint64_t> changes{0};
     std::array<RunQueue, 2> runQueues;
     std::span<SequenceSlot> sequences;
     std::span<SequenceSlot> computeSequences;
@@ -298,6 +300,10 @@ struct Manager {
 static_assert(sizeof(Manager) <= StateEnd - StateOffset);
 
 thread_local Manager* currentWorker = nullptr;
+
+void Changed(Manager& manager) {
+    manager.changes.fetch_add(1, std::memory_order_release);
+}
 
 void WakeWorkers(Manager& manager, std::uint32_t invocations, bool publisherCanRun = true) {
     const std::uint32_t available = invocations - (publisherCanRun && currentWorker == &manager ? 1u : 0u);
@@ -404,6 +410,7 @@ void Sequence::Advance() {
             cursor = item.next;
             manager->runQueues[priority].Push(&item);
             manager->pendingInvocations -= item.cpu.count;
+            Changed(*manager);
             WakeWorkers(*manager, item.cpu.count);
             continue;
         }
@@ -825,15 +832,19 @@ void* APS5_VABI WorkerEntry(void* argument) {
         }
         const bool spinning = manager.pendingInvocations != 0 && __rdtsc() - lastWork < manager.spinTicks;
         if (spinning || manager.sleepingWorkers >= manager.workerCount - manager.persistentThreads) {
+            const std::uint64_t seen = manager.changes.load(std::memory_order_relaxed);
+            const std::uint64_t spinTicks = manager.spinTicks;
             guard.unlock();
-            _mm_pause();
+            while (manager.changes.load(std::memory_order_acquire) == seen && (!spinning || __rdtsc() - lastWork < spinTicks)) _mm_pause();
             guard.lock();
             continue;
         }
         ++manager.sleepingWorkers;
+        Changed(manager);
         manager.work.wait(guard, [&manager] { return !manager.running || manager.wakeTokens != 0; });
         if (manager.wakeTokens != 0) --manager.wakeTokens;
         --manager.sleepingWorkers;
+        Changed(manager);
     }
     currentWorker = nullptr;
     return nullptr;
@@ -945,6 +956,7 @@ void StopManager(Manager& manager) {
     {
         const std::lock_guard guard(manager.lock);
         manager.running = false;
+        Changed(manager);
         manager.work.notify_all();
     }
     while (manager.activeWorkers != 0) {
@@ -1140,6 +1152,7 @@ int APS5_VABI _ZN3sce3Job10JobManager8shutdownEv(void* self) {
     {
         const std::lock_guard guard(manager->lock);
         manager->running = false;
+        Changed(*manager);
     }
     StopManager(*manager);
     static_cast<void>(_sceUlobjmgrUnregisterObject_nid_postfix(manager->objectId));
@@ -1162,6 +1175,7 @@ int APS5_VABI _ZN3sce3Job10JobManager24setPersistentThreadCountEj(void* self, st
     if (count > manager->workerCount) return ManagerInvalidArgument;
     const std::lock_guard guard(manager->lock);
     manager->persistentThreads = count;
+    Changed(*manager);
     return 0;
 }
 
